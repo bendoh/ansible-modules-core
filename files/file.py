@@ -22,6 +22,7 @@ import errno
 import shutil
 import stat
 import grp
+import gzip
 import pwd
 
 DOCUMENTATION = '''
@@ -58,9 +59,11 @@ options:
         If C(touch) (new in 1.4), an empty file will be created if the C(path) does not
         exist, while an existing file or directory will receive updated file access and
         modification times (similar to the way `touch` works from the command line).
+        If C(compress) (new in 2.2), the file will be compressed with gzip and stored
+        as <path>.gz
     required: false
     default: file
-    choices: [ file, link, directory, hard, touch, absent ]
+    choices: [ file, link, directory, hard, touch, absent, compress ]
   src:
     required: false
     default: null
@@ -109,13 +112,19 @@ EXAMPLES = '''
 # create a directory if it doesn't exist
 - file: path=/etc/some_directory state=directory mode=0755
 
+# ensure that a large sql dump is compressed
+- file: path=/etc/path_compress state=compress mode
+
 '''
 
+compress_exts = (dict(gzip='gz'))
 
-def get_state(path):
+def get_state(path, compression='gzip'):
     ''' Find out current state '''
 
-    if os.path.lexists(path):
+    if compression == 'gzip' and os.path.exists('%s.%s' % (path, compress_exts[compression])):
+        return 'compress'
+    elif os.path.lexists(path):
         if os.path.islink(path):
             return 'link'
         elif os.path.isdir(path):
@@ -154,7 +163,7 @@ def main():
 
     module = AnsibleModule(
         argument_spec = dict(
-            state = dict(choices=['file','directory','link','hard','touch','absent'], default=None),
+            state = dict(choices=['file','directory','link','hard','touch','absent','compress'], default=None),
             path  = dict(aliases=['dest', 'name'], required=True),
             original_basename = dict(required=False), # Internal use only, for recursive ops
             recurse  = dict(default=False, type='bool'),
@@ -162,6 +171,7 @@ def main():
             diff_peek = dict(default=None), # Internal use only, for internal checks in the action plugins
             validate = dict(required=False, default=None), # Internal use only, for template and copy
             src = dict(required=False, default=None),
+            compression = dict(choices=['gzip'], default='gzip'), # Eventually support additional formats?
         ),
         add_file_common_args=True,
         supports_check_mode=True
@@ -173,9 +183,11 @@ def main():
     diff_peek = params['diff_peek']
     src = params['src']
     follow = params['follow']
+    compression = params['compression']
 
     # modify source as we later reload and pass, specially relevant when used by other modules.
     params['path'] = path = os.path.expanduser(params['path'])
+    compress_path = '%s.%s' % (path, compress_exts[compression])
 
     # short-circuit for diff_peek
     if diff_peek is not None:
@@ -190,7 +202,7 @@ def main():
             pass
         module.exit_json(path=path, changed=False, appears_binary=appears_binary)
 
-    prev_state = get_state(path)
+    prev_state = get_state(path, compression)
 
 
     # state should default to file, but since that creates many conflicts,
@@ -242,7 +254,11 @@ def main():
     if prev_state != state:
         diff['before']['state'] = prev_state
         diff['after']['state'] = state
+
         state_change = True
+
+    if prev_state == 'compress':
+        diff['before']['path'] = compress_path
 
     if state == 'absent':
         if state_change:
@@ -254,17 +270,22 @@ def main():
                         e = get_exception()
                         module.fail_json(msg="rmtree failed: %s" % str(e))
                 else:
+                    if prev_state == 'compress':
+                        unlink_path = compress_path
+                    else:
+                        unlink_path = path
+
                     try:
-                        os.unlink(path)
+                        os.unlink(unlink_path)
                     except Exception:
                         e = get_exception()
                         module.fail_json(path=path, msg="unlinking failed: %s " % str(e))
+
             module.exit_json(path=path, changed=True, diff=diff)
         else:
             module.exit_json(path=path, changed=False)
 
     elif state == 'file':
-
         if state_change:
             if follow and prev_state == 'link':
                 # follow symlink and operate on original
@@ -272,7 +293,30 @@ def main():
                 prev_state = get_state(path)
                 file_args['path'] = path
 
-        if prev_state not in ['file','hard']:
+            if prev_state == 'compress':
+                if module.check_mode:
+                    module.exit_json(path=path, changed=True, diff=diff)
+
+                # Decompress
+                if compression == 'gzip':
+                    try:
+                        with gzip.open(compress_path) as f_in, open(path, 'w') as f_out:
+                            shutil.copyfileobj(f_in, f_out) 
+                    except OSError:
+                        e = get_exception
+                        module.fail_json(path=path, msg='Unable to write to compressed file: %s' % str(e))
+
+                    try:
+                        os.remove(compress_path)
+                    except OSError:
+                        e = get_exception
+                        module.fail_json(path=path, msg='Unable to delete compressed file: %s' % str(e))
+                else:
+                    module.fail_json(path=path, msg='Error, compression type %s is not supported' % compression)
+
+                changed = True
+
+        if prev_state not in ['file','hard','compress']:
             # file is not absent and any other state is a conflict
             module.fail_json(path=path, msg='file (%s) is %s, cannot continue' % (path, prev_state))
 
@@ -431,6 +475,41 @@ def main():
                 raise e
 
         module.exit_json(dest=path, changed=True, diff=diff)
+
+    elif state == 'compress':
+        if state_change:
+            if prev_state == 'file':
+                if module.check_mode:
+                    module.exit_json(path=path, changed=True, diff=diff)
+                # Compress the file
+                if compression == 'gzip':
+                    try:
+                        with open(path) as f_in, gzip.open(compress_path, 'w') as f_out:
+                            shutil.copyfileobj(f_in, f_out) 
+                    except OSError:
+                        e = get_exception()
+                        module.fail_json(path=path, msg='Error, could not write compressed file: %s' % str(e))
+
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        e = get_exception()
+                        module.fail_json(path=path, msg='Error, could not remove uncompressed file: %s' % str(e))
+                else:
+                    module.fail_json(path=path, msg='Error, compression type %s is not supported' % compression)
+
+                changed = True
+            else:
+                # Can't compress missing or linked files
+                module.fail_json(path=path, msg="Can only compress regular files")
+
+        diff['after']['path'] = compress_path
+        file_args['path'] = compress_path
+
+        changed = module.set_fs_attributes_if_different(file_args, changed, diff)
+
+        module.exit_json(path=path, changed=changed, diff=diff)
+
 
     module.fail_json(path=path, msg='unexpected position reached')
 
