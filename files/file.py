@@ -300,8 +300,11 @@ def main():
                 # Decompress
                 if compression == 'gzip':
                     try:
-                        with gzip.open(compress_path) as f_in, open(path, 'w') as f_out:
-                            shutil.copyfileobj(f_in, f_out) 
+                        f_in = gzip.open(compress_path)
+                        f_out = open(path, 'w')
+                        shutil.copyfileobj(f_in, f_out)
+                        f_in.close()
+                        f_out.close()
                     except OSError:
                         e = get_exception
                         module.fail_json(path=path, msg='Unable to write to compressed file: %s' % str(e))
@@ -484,8 +487,11 @@ def main():
                 # Compress the file
                 if compression == 'gzip':
                     try:
-                        with open(path) as f_in, gzip.open(compress_path, 'w') as f_out:
-                            shutil.copyfileobj(f_in, f_out) 
+                        f_in = open(path)
+                        f_out = gzip.open(compress_path, 'w')
+                        shutil.copyfileobj(f_in, f_out)
+                        f_in.close()
+                        f_out.close()
                     except OSError:
                         e = get_exception()
                         module.fail_json(path=path, msg='Error, could not write compressed file: %s' % str(e))
